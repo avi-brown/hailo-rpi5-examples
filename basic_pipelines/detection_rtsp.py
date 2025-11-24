@@ -12,6 +12,7 @@ import subprocess
 import signal
 import threading
 import time
+import copy
 
 from hailo_apps.hailo_app_python.core.common.buffer_utils import get_caps_from_pad, get_numpy_from_buffer
 from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
@@ -56,11 +57,12 @@ def rtsp_source_pipeline(
     fps_caps = f"video/x-raw, framerate={frame_rate}/1" if sync == "true" else "video/x-raw"
 
     pipeline = (
+        # Keep appsrc bounded and drop old buffers to prevent latency buildup.
         f"appsrc name={name}_appsrc is-live=true do-timestamp=true format=time "
-        f"block=true max-bytes=0 "
+        f"block=true max-buffers=2 "
         f"caps=video/x-raw,format={video_format},width={video_width},height={video_height},"
         f"framerate={frame_rate}/1,pixel-aspect-ratio=1/1 ! "
-        f'{QUEUE(name=f"{name}_src_q")} ! '
+        f'{QUEUE(name=f"{name}_src_q", max_size_buffers=1, leaky="downstream")} ! '
         f"videoconvert n-threads=3 name={name}_convert qos=false ! "
         f"videoscale name={name}_videoscale n-threads=2 ! "
         f"video/x-raw, pixel-aspect-ratio=1/1, format={video_format}, width={video_width}, height={video_height} ! "
@@ -76,10 +78,17 @@ def rtsp_source_pipeline(
 class user_app_callback_class(app_callback_class):
     def __init__(self):
         super().__init__()
-        self.new_variable = 42
+        self._payload_lock = threading.Lock()
+        self._latest_payload = None
 
-    def new_function(self):
-        return "The meaning of life is: "
+    def set_payload(self, payload: dict):
+        with self._payload_lock:
+            # Keep a copy to avoid accidental mutation from other threads.
+            self._latest_payload = copy.deepcopy(payload)
+
+    def get_payload(self):
+        with self._payload_lock:
+            return copy.deepcopy(self._latest_payload)
 
 
 # -----------------------------------------------------------------------------------------------
@@ -159,10 +168,8 @@ def app_callback(pad, info, user_data):
             }
         )
 
-    try:
-        UDP_SOCKET.sendto(json.dumps(payload).encode("utf-8"), UDP_TARGET)
-    except OSError as exc:
-        print(f"Failed to publish detections: {exc}")
+    # Stash latest payload for the publisher thread to send at a fixed rate.
+    user_data.set_payload(payload)
 
     if user_data.use_frame and frame is not None:
         cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -181,6 +188,9 @@ class RTSPDetectionApp(GStreamerDetectionApp):
         self.ffmpeg_thread = None
         self.appsrc = None
         self.running = True
+        self.publish_thread = None
+        self.publish_interval = 0.02  # 50 Hz
+        self.user_data_ref = user_data
         super().__init__(app_callback, user_data, parser)
 
     def start_ffmpeg(self):
@@ -249,6 +259,22 @@ class RTSPDetectionApp(GStreamerDetectionApp):
             raise RuntimeError("source_appsrc not found in pipeline")
         self.ffmpeg_thread = threading.Thread(target=self.pump_ffmpeg_to_appsrc, daemon=True)
         self.ffmpeg_thread.start()
+        self.publish_thread = threading.Thread(target=self.publish_loop, daemon=True)
+        self.publish_thread.start()
+
+    def publish_loop(self):
+        """Send latest payload at a fixed 50 Hz rate, reusing the newest detections."""
+        while self.running:
+            start = time.time()
+            payload = self.user_data_ref.get_payload()
+            if payload:
+                try:
+                    UDP_SOCKET.sendto(json.dumps(payload).encode("utf-8"), UDP_TARGET)
+                except OSError as exc:
+                    print(f"Failed to publish detections: {exc}")
+            elapsed = time.time() - start
+            sleep_for = max(0.0, self.publish_interval - elapsed)
+            time.sleep(sleep_for)
 
     def get_pipeline_string(self):
         source_pipeline = rtsp_source_pipeline(
@@ -290,6 +316,8 @@ class RTSPDetectionApp(GStreamerDetectionApp):
                 self.ffmpeg_proc.kill()
         if self.ffmpeg_thread:
             self.ffmpeg_thread.join(timeout=2)
+        if self.publish_thread:
+            self.publish_thread.join(timeout=2)
         super().shutdown(signum, frame)
 
 
