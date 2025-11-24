@@ -3,6 +3,8 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 import os
+import json
+import socket
 import numpy as np
 import cv2
 import hailo
@@ -27,6 +29,10 @@ from hailo_apps.hailo_app_python.apps.detection.detection_pipeline import GStrea
 RTSP_URI = "rtsp://192.168.1.41:554/stream/main"
 RTSP_TRANSPORT = "tcp"  # Passed to ffmpeg's -rtsp_transport
 FFMPEG_BIN = "ffmpeg"
+
+# Telemetry publishing
+UDP_TARGET = ("192.168.1.30", 6666)
+UDP_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Video configuration
 VIDEO_WIDTH = 1280
@@ -88,6 +94,8 @@ def app_callback(pad, info, user_data):
     string_to_print = f"Frame count: {user_data.get_count()}\n"
 
     format, width, height = get_caps_from_pad(pad)
+    image_width = int(width) if width is not None else VIDEO_WIDTH
+    image_height = int(height) if height is not None else VIDEO_HEIGHT
 
     frame = None
     if user_data.use_frame and format is not None and width is not None and height is not None:
@@ -110,6 +118,51 @@ def app_callback(pad, info, user_data):
             track_id = track[0].get_id()
         string_to_print += f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n"
         detection_count += 1
+
+    # Build and publish payload with detected objects
+    payload = {
+        "stream_path": RTSP_URI,
+        "objects": [],
+    }
+    for detection in list(detections):
+        label = detection.get_label()
+        bbox = detection.get_bbox()
+        confidence = detection.get_confidence()
+        if label not in CLASSES_OF_INTEREST or confidence < MIN_CONFIDENCE:
+            continue
+        track_id = 0
+        track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+        if len(track) == 1:
+            track_id = track[0].get_id()
+        # HailoBBox exposes callables for each coordinate
+        xmin = float(bbox.xmin())
+        ymin = float(bbox.ymin())
+        xmax = float(bbox.xmax())
+        ymax = float(bbox.ymax())
+        # Hailo bbox is normalized [0,1]; convert to pixel coordinates
+        xmin_px = xmin * image_width
+        xmax_px = xmax * image_width
+        ymin_px = ymin * image_height
+        ymax_px = ymax * image_height
+        centroid_x = (xmin_px + xmax_px) / 2.0
+        centroid_y = (ymin_px + ymax_px) / 2.0
+        payload["objects"].append(
+            {
+                "id": int(track_id),
+                "class": label,
+                "confidence": float(confidence),
+                "corners": {
+                    "top_left": [xmin_px, ymin_px],
+                    "bottom_right": [xmax_px, ymax_px],
+                },
+                "centroid": [centroid_x, centroid_y],
+            }
+        )
+
+    try:
+        UDP_SOCKET.sendto(json.dumps(payload).encode("utf-8"), UDP_TARGET)
+    except OSError as exc:
+        print(f"Failed to publish detections: {exc}")
 
     if user_data.use_frame and frame is not None:
         cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
