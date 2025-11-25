@@ -40,7 +40,8 @@ VIDEO_HEIGHT = 720
 FRAME_RATE = 30
 
 # Filtering
-MIN_CONFIDENCE = 0.7
+MIN_CONFIDENCE = 0.6
+KEYPOINTS_OF_INTEREST = ("nose", "left_eye", "right_eye", "left_ear", "right_ear")
 
 
 def rtsp_source_pipeline(
@@ -92,25 +93,14 @@ class user_app_callback_class(app_callback_class):
 # Helper for COCO keypoints ordering
 # -----------------------------------------------------------------------------------------------
 def get_keypoints():
-    return {
+    coco_keypoints = {
         "nose": 0,
         "left_eye": 1,
         "right_eye": 2,
         "left_ear": 3,
         "right_ear": 4,
-        "left_shoulder": 5,
-        "right_shoulder": 6,
-        "left_elbow": 7,
-        "right_elbow": 8,
-        "left_wrist": 9,
-        "right_wrist": 10,
-        "left_hip": 11,
-        "right_hip": 12,
-        "left_knee": 13,
-        "right_knee": 14,
-        "left_ankle": 15,
-        "right_ankle": 16,
     }
+    return {name: coco_keypoints[name] for name in KEYPOINTS_OF_INTEREST}
 
 
 # -----------------------------------------------------------------------------------------------
@@ -162,14 +152,23 @@ def app_callback(pad, info, user_data):
 
         points = landmarks[0].get_points()
         keypoints_payload = {}
+        head_points = []
         for name, idx in keypoints.items():
             point = points[idx]
             x = (point.x() * bbox.width() + bbox.xmin()) * image_width
             y = (point.y() * bbox.height() + bbox.ymin()) * image_height
             string_to_print += f"{name}: x={x:.1f} y={y:.1f}\n"
             keypoints_payload[name] = [float(x), float(y)]
+            head_points.append((x, y))
             if user_data.use_frame and frame is not None:
                 cv2.circle(frame, (int(x), int(y)), 4, (0, 255, 0), -1)
+        if head_points:
+            head_x = sum(p[0] for p in head_points) / len(head_points)
+            head_y = sum(p[1] for p in head_points) / len(head_points)
+            string_to_print += f"head: x={head_x:.1f} y={head_y:.1f}\n"
+            keypoints_payload["head"] = [float(head_x), float(head_y)]
+            if user_data.use_frame and frame is not None:
+                cv2.circle(frame, (int(head_x), int(head_y)), 5, (255, 0, 0), -1)
         payload["objects"].append(
             {
                 "id": int(track_id),
@@ -200,7 +199,7 @@ class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
         self.appsrc = None
         self.running = True
         self.publish_thread = None
-        self.publish_interval = 0.02  # 50 Hz
+        self.publish_interval = 0.01  # 50 Hz
         self.user_data_ref = user_data
         super().__init__(app_callback, user_data, parser)
 
