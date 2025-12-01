@@ -27,7 +27,7 @@ from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines impor
 from hailo_apps.hailo_app_python.apps.detection.detection_pipeline import GStreamerDetectionApp
 
 # RTSP configuration
-RTSP_URI = "rtsp://192.168.1.41:554/stream/main"
+RTSP_URI = "rtsp://192.168.1.41:554/stream/sub"
 RTSP_TRANSPORT = "tcp"  # Passed to ffmpeg's -rtsp_transport
 FFMPEG_BIN = "ffmpeg"
 
@@ -36,8 +36,8 @@ UDP_TARGET = ("192.168.1.30", 6666)
 UDP_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Video configuration
-VIDEO_WIDTH = 1280
-VIDEO_HEIGHT = 720
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 360
 FRAME_RATE = 30
 
 # Detection filtering
@@ -46,8 +46,8 @@ MIN_CONFIDENCE = 0.7
 
 
 def rtsp_source_pipeline(
-    video_width: int = 1280,
-    video_height: int = 720,
+    video_width: int = 640,
+    video_height: int = 360,
     frame_rate: int = 30,
     sync: str = "false",
     name: str = "source",

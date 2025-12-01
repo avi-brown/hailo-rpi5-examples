@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
@@ -8,10 +9,11 @@ import socket
 import subprocess
 import signal
 import threading
+import time
 import cv2
 import hailo
 import copy
-import time
+from collections import deque
 
 from hailo_apps.hailo_app_python.core.common.buffer_utils import get_caps_from_pad, get_numpy_from_buffer
 from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callback_class
@@ -23,7 +25,10 @@ from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_helper_pipelines impor
     USER_CALLBACK_PIPELINE,
     DISPLAY_PIPELINE,
 )
-from hailo_apps.hailo_app_python.apps.pose_estimation.pose_estimation_pipeline import GStreamerPoseEstimationApp
+from hailo_apps.hailo_app_python.apps.pose_estimation.pose_estimation_pipeline import (
+    GStreamerPoseEstimationApp,
+    get_default_parser,
+)
 
 # RTSP configuration
 RTSP_URI = "rtsp://192.168.1.41:554/stream/main"
@@ -35,8 +40,8 @@ UDP_TARGET = ("192.168.1.30", 6666)
 UDP_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Video configuration
-VIDEO_WIDTH = 1280
-VIDEO_HEIGHT = 720
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 360
 FRAME_RATE = 30
 
 # Filtering
@@ -45,8 +50,8 @@ KEYPOINTS_OF_INTEREST = ("nose", "left_eye", "right_eye", "left_ear", "right_ear
 
 
 def rtsp_source_pipeline(
-    video_width: int = 1280,
-    video_height: int = 720,
+    video_width: int = 640,
+    video_height: int = 360,
     frame_rate: int = 30,
     sync: str = "false",
     name: str = "source",
@@ -79,14 +84,75 @@ class user_app_callback_class(app_callback_class):
         super().__init__()
         self._payload_lock = threading.Lock()
         self._latest_payload = None
+        self._latest_payload_bytes = None
+        self._payload_event = threading.Event()
+        self._rate_lock = threading.Lock()
+        self._last_rate_time = time.time()
+        self._last_count = 0
+        self._inference_rate = 0.0
+        self._timing_lock = threading.Lock()
+        self._push_times = deque(maxlen=400)  # FIFO arrival times
+        self._last_push_ts = None
+        self._last_inference_latency = None
 
     def set_payload(self, payload: dict):
+        payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         with self._payload_lock:
-            self._latest_payload = copy.deepcopy(payload)
+            self._latest_payload = payload
+            self._latest_payload_bytes = payload_bytes
+            self._payload_event.set()
 
     def get_payload(self):
         with self._payload_lock:
             return copy.deepcopy(self._latest_payload)
+
+    def get_payload_bytes(self):
+        with self._payload_lock:
+            return self._latest_payload_bytes
+
+    def wait_for_payload(self, timeout=None):
+        if not self._payload_event.wait(timeout):
+            return None
+        with self._payload_lock:
+            payload_bytes = self._latest_payload_bytes
+        self._payload_event.clear()
+        return payload_bytes
+
+    def notify_publishers(self):
+        # Wake any waiting publisher threads (e.g., during shutdown).
+        self._payload_event.set()
+
+    def update_inference_rate(self) -> float:
+        # Compute a smoothed inference rate over ~1 second windows.
+        with self._rate_lock:
+            now = time.time()
+            elapsed = now - self._last_rate_time
+            if elapsed >= 1.0:
+                current_count = self.get_count()
+                self._inference_rate = (current_count - self._last_count) / elapsed
+                self._last_count = current_count
+                self._last_rate_time = now
+            return self._inference_rate
+
+    def record_push_time(self, ts: float):
+        # Track when a buffer entered the pipeline so we can compute latency later.
+        with self._timing_lock:
+            self._push_times.append(ts)
+
+    def pop_push_time(self):
+        with self._timing_lock:
+            if self._push_times:
+                return self._push_times.popleft()
+            return None
+
+    def note_inference(self, push_ts: float, inference_latency: float):
+        with self._timing_lock:
+            self._last_push_ts = push_ts
+            self._last_inference_latency = inference_latency
+
+    def get_last_timing(self):
+        with self._timing_lock:
+            return self._last_push_ts, self._last_inference_latency
 
 
 # -----------------------------------------------------------------------------------------------
@@ -112,11 +178,23 @@ def app_callback(pad, info, user_data):
         return Gst.PadProbeReturn.OK
 
     user_data.increment()
-    string_to_print = f"Frame count: {user_data.get_count()}\n"
+    inference_rate = user_data.update_inference_rate()
+    push_time = user_data.pop_push_time()
+    inference_latency_ms = (time.time() - push_time) * 1000.0 if push_time is not None else None
+    if inference_latency_ms is not None:
+        user_data.note_inference(push_time, inference_latency_ms / 1000.0)
+    string_to_print = (
+        f"Frame count: {user_data.get_count()}\n"
+        f"Inference rate: {inference_rate:.2f} FPS\n"
+    )
+    if inference_latency_ms is not None:
+        string_to_print += f"Latency (push->callback): {inference_latency_ms:.1f} ms\n"
 
     format, width, height = get_caps_from_pad(pad)
     image_width = int(width) if width is not None else VIDEO_WIDTH
     image_height = int(height) if height is not None else VIDEO_HEIGHT
+    center_x = image_width / 2.0
+    center_y = image_height / 2.0
 
     frame = None
     if user_data.use_frame and format is not None and width is not None and height is not None:
@@ -151,6 +229,8 @@ def app_callback(pad, info, user_data):
             continue
 
         points = landmarks[0].get_points()
+        error_x = None
+        error_y = None
         keypoints_payload = {}
         head_points = []
         for name, idx in keypoints.items():
@@ -167,6 +247,9 @@ def app_callback(pad, info, user_data):
             head_y = sum(p[1] for p in head_points) / len(head_points)
             string_to_print += f"head: x={head_x:.1f} y={head_y:.1f}\n"
             keypoints_payload["head"] = [float(head_x), float(head_y)]
+            error_x = float(head_x - center_x)
+            error_y = float(head_y - center_y)
+            string_to_print += f"error_x={error_x:.1f} error_y={error_y:.1f}\n"
             if user_data.use_frame and frame is not None:
                 cv2.circle(frame, (int(head_x), int(head_y)), 5, (255, 0, 0), -1)
         payload["objects"].append(
@@ -175,6 +258,8 @@ def app_callback(pad, info, user_data):
                 "class": label,
                 "confidence": float(confidence),
                 "keypoints": keypoints_payload,
+                "error_x": error_x if head_points else None,
+                "error_y": error_y if head_points else None,
             }
         )
 
@@ -193,14 +278,15 @@ def app_callback(pad, info, user_data):
 class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
     """Pose estimation app wired to an RTSP source."""
 
-    def __init__(self, app_callback, user_data, parser=None):
+    def __init__(self, app_callback, user_data, parser=None, headless: bool = False):
         self.ffmpeg_proc = None
         self.ffmpeg_thread = None
         self.appsrc = None
         self.running = True
         self.publish_thread = None
-        self.publish_interval = 0.01  # 50 Hz
+        self.publish_interval = 0.01  # used as timeout fallback
         self.user_data_ref = user_data
+        self.headless = headless
         super().__init__(app_callback, user_data, parser)
 
     def start_ffmpeg(self):
@@ -245,6 +331,7 @@ class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
             buf.fill(0, data)
             buf.pts = pts
             buf.duration = frame_duration
+            self.user_data_ref.record_push_time(time.time())
             pts += frame_duration
             ret = self.appsrc.emit("push-buffer", buf)
             if ret != Gst.FlowReturn.OK:
@@ -260,6 +347,11 @@ class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
         self.frame_rate = FRAME_RATE
         self.video_width = VIDEO_WIDTH
         self.video_height = VIDEO_HEIGHT
+        if self.headless:
+            # Drop rendering pipeline and frame conversions for lower latency.
+            self.video_sink = "fakesink"
+            self.show_fps = False
+            self.user_data_ref.use_frame = False
         self.start_ffmpeg()
         super().create_pipeline()
         self.appsrc = self.pipeline.get_by_name("source_appsrc")
@@ -271,18 +363,21 @@ class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
         self.publish_thread.start()
 
     def publish_loop(self):
-        """Send latest payload at a fixed 50 Hz rate, reusing the newest keypoints."""
+        """Send latest payload as soon as it is available, with a short timeout fallback."""
         while self.running:
-            start = time.time()
-            payload = self.user_data_ref.get_payload()
-            if payload:
+            payload_bytes = self.user_data_ref.wait_for_payload(timeout=self.publish_interval)
+            if not self.running:
+                break
+            if payload_bytes:
                 try:
-                    UDP_SOCKET.sendto(json.dumps(payload).encode("utf-8"), UDP_TARGET)
+                    push_ts, _ = self.user_data_ref.get_last_timing()
+                    send_ts = time.time()
+                    publish_latency_ms = (send_ts - push_ts) * 1000.0 if push_ts is not None else None
+                    if publish_latency_ms is not None:
+                        print(f"Latency (push->UDP send): {publish_latency_ms:.1f} ms")
+                    UDP_SOCKET.sendto(payload_bytes, UDP_TARGET)
                 except OSError as exc:
                     print(f"Failed to publish keypoints: {exc}")
-            elapsed = time.time() - start
-            sleep_for = max(0.0, self.publish_interval - elapsed)
-            time.sleep(sleep_for)
 
     def get_pipeline_string(self):
         source_pipeline = rtsp_source_pipeline(
@@ -314,6 +409,8 @@ class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
 
     def shutdown(self, signum=None, frame=None):
         self.running = False
+        if hasattr(self.user_data_ref, "notify_publishers"):
+            self.user_data_ref.notify_publishers()
         if getattr(self, "ffmpeg_proc", None):
             self.ffmpeg_proc.send_signal(signal.SIGTERM)
             try:
@@ -328,10 +425,17 @@ class RTSPPoseEstimationApp(GStreamerPoseEstimationApp):
 
 
 if __name__ == "__main__":
+    parser = get_default_parser()
+    parser.add_argument("--no-display", action="store_true", help="Disable display/rendering to reduce latency.")
+    # Peek at args to set headless before handing parser to the app (parser will be parsed again inside).
+    parsed_args = parser.parse_args()
+
     project_root = Path(__file__).resolve().parent.parent
     env_file = project_root / ".env"
     os.environ["HAILO_ENV_FILE"] = str(env_file)
 
     user_data = user_app_callback_class()
-    app = RTSPPoseEstimationApp(app_callback, user_data)
+    if parsed_args.no_display:
+        user_data.use_frame = False
+    app = RTSPPoseEstimationApp(app_callback, user_data, parser=parser, headless=parsed_args.no_display)
     app.run()
